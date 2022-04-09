@@ -16,48 +16,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bus = pipeline.bus().unwrap();
     let main_loop = gst::glib::MainLoop::new(None, false);
 
-    let uridecodebin = gst::ElementFactory::make("uridecodebin", Some("uridecodebin"))?;
+    // uridecodebin3 works for reconnect where uridecodebin does not
+    let uridecodebin = gst::ElementFactory::make("uridecodebin3", Some("uridecodebin3"))?;
     uridecodebin.try_set_property("uri", uri)?;
+    uridecodebin.connect("source-setup", false, move |args| {
+        let source = args[1].get::<gst::Element>().unwrap();
+        if source.class().type_().name() == "GstRTSPSrc" {
+            // set protocol to TCP
+            source
+                .try_set_property("protocols", gst_rtsp::RTSPLowerTrans::TCP)
+                .unwrap();
+        }
 
-    // create a sink and add a probe so can verify buffers are being received from uridecodebin (i.e. connection is working)
+        None
+    });
+
+    // create a sink and add a probe so can verify buffers are being received from uridecodebin3 (i.e. connection is working)
     let fakesink = gst::ElementFactory::make("fakesink", Some("fakesink"))?;
     fakesink
         .static_pad("sink")
         .unwrap()
         .add_probe(gst::PadProbeType::BUFFER, |_, probe_info| {
-            if let Some(gst::PadProbeData::Buffer(ref _buffer)) = probe_info.data {
+            if let Some(gst::PadProbeData::Buffer(_)) = probe_info.data {
                 println!("fakesink received buffer");
             }
-
             gst::PadProbeReturn::Ok
         });
 
     pipeline.add_many(&[&uridecodebin, &fakesink])?;
 
-    // link to fakesink after connection
+    // link to fakesink after connection but only for video_*
     let pipeline_weak = pipeline.downgrade();
-    uridecodebin.connect_pad_added(move |source_element, _src_pad| {
-        let pipeline = match pipeline_weak.upgrade() {
-            Some(pipeline) => pipeline,
-            None => return,
-        };
+    uridecodebin.connect_pad_added(move |_, src_pad| {
+        if src_pad.name().starts_with("video_") {
+            let pipeline = match pipeline_weak.upgrade() {
+                Some(pipeline) => pipeline,
+                None => return,
+            };
 
-        let fakesink = pipeline.by_name("fakesink").unwrap();
-        source_element.link(&fakesink).unwrap();
+            let fakesink = pipeline.by_name("fakesink").unwrap();
+            let sink_pad = fakesink.static_pad("sink").unwrap();
+            src_pad.link(&sink_pad).unwrap();
+        }
     });
 
     pipeline.set_state(gst::State::Playing)?;
 
     bus.add_watch(move |_, message| {
-        println!("{:?}", message);
-
-        // listen for any errors/warnings from uridecodebin (or children) (like disconnection or failure to connect events)
         if let Some(src) = message.src() {
             let parent = src.parent();
 
-            if src.name() == "uridecodebin"
+            let grandparent = parent.clone().map(|parent| parent.parent()).unwrap_or(None);
+
+            if src.name() == "uridecodebin3"
                 || parent
-                    .map(|parent| parent.name() == "uridecodebin")
+                    .map(|parent| parent.name() == "uridecodebin3")
+                    .unwrap_or(false)
+                || grandparent
+                    .map(|grandparent| grandparent.name() == "uridecodebin3")
                     .unwrap_or(false)
             {
                 match message.view() {
